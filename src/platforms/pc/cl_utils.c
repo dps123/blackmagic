@@ -28,11 +28,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-
+#include "version.h"
 #include "target.h"
 #include "target_internal.h"
+#include "cortexm.h"
 
 #include "cl_utils.h"
+#include "bmp_hosted.h"
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -113,17 +115,20 @@ static void bmp_munmap(struct mmap_data *map)
 #endif
 }
 
-static void cl_help(char **argv, BMP_CL_OPTIONS_t *opt)
+static void cl_help(char **argv)
 {
-	DEBUG_WARN("%s for: \n", opt->opt_idstring);
-	DEBUG_WARN("\tBMP Firmware, ST-Link V2/3, CMSIS_DAP, JLINK and "
-			   "LIBFTDI/MPSSE\n\n");
+	bmp_ident(NULL);
 	DEBUG_WARN("Usage: %s [options]\n", argv[0]);
 	DEBUG_WARN("\t-h\t\t: This help.\n");
 	DEBUG_WARN("\t-v[bitmask]\t: Increasing verbosity. Bitmask:\n");
 	DEBUG_WARN("\t\t\t  1 = INFO, 2 = GDB, 4 = TARGET, 8 = PROBE, 16 = WIRE\n");
 	DEBUG_WARN("Probe selection arguments:\n");
-	DEBUG_WARN("\t-d \"path\"\t: Use serial device at \"path\"\n");
+	DEBUG_WARN("\t-d \"path\"\t: Use serial BMP device at <path>");
+#if HOSTED_BMP_ONLY == 1 && defined(__APPLE__)
+	DEBUG_WARN("\n");
+#else
+	DEBUG_WARN(". Deprecated!\n");
+#endif
 	DEBUG_WARN("\t-P <pos>\t: Use debugger found at position <pos>\n");
 	DEBUG_WARN("\t-n <num>\t: Use target device found at position <num>\n");
 	DEBUG_WARN("\t-s \"serial\"\t: Use dongle with (partial) "
@@ -133,9 +138,12 @@ static void cl_help(char **argv, BMP_CL_OPTIONS_t *opt)
 	DEBUG_WARN("Run mode related options:\n");
 	DEBUG_WARN("\tDefault mode is to start the debug server at :2000\n");
 	DEBUG_WARN("\t-j\t\t: Use JTAG. SWD is default.\n");
+	DEBUG_WARN("\t-f\t\t: Set minimum high and low times of SWJ waveform.\n");
 	DEBUG_WARN("\t-C\t\t: Connect under reset\n");
 	DEBUG_WARN("\t-t\t\t: Scan SWD or JTAG and display information about \n"
 			   "\t\t\t  connected devices\n");
+	DEBUG_WARN("\t-T\t\t: Continious read/write-back some value to allow\n"
+			   "\t\t\t  timing insection of SWJ. Abort with ^C\n");
 	DEBUG_WARN("\t-e\t\t: Assume \"resistor SWD connection\" on FTDI: TDI\n"
                "\t\t\t  connected to TMS, TDO to TDI with eventual resistor\n");
 	DEBUG_WARN("\t-E\t\t: Erase flash until flash end or for given size\n");
@@ -159,14 +167,16 @@ void cl_init(BMP_CL_OPTIONS_t *opt, int argc, char **argv)
 	opt->opt_target_dev = 1;
 	opt->opt_flash_size = 16 * 1024 *1024;
 	opt->opt_flash_start = 0xffffffff;
-	while((c = getopt(argc, argv, "eEhHv:d:s:I:c:CnltVta:S:jpP:rR")) != -1) {
+	opt->opt_max_swj_frequency = 4000000;
+	while((c = getopt(argc, argv, "eEhHv:d:f:s:I:c:CnltVtTa:S:jpP:rR")) != -1) {
 		switch(c) {
 		case 'c':
 			if (optarg)
 				opt->opt_cable = optarg;
 			break;
 		case 'h':
-			cl_help(argv, opt);
+			cl_debuglevel = 3;
+			cl_help(argv);
 			break;
 		case 'H':
 			opt->opt_no_hl = true;
@@ -192,6 +202,21 @@ void cl_init(BMP_CL_OPTIONS_t *opt, int argc, char **argv)
 			if (optarg)
 				opt->opt_device = optarg;
 			break;
+		case 'f':
+			if (optarg) {
+				char *p;
+				uint32_t frequency = strtol(optarg, &p, 10);
+				switch(*p) {
+				case 'k':
+					frequency *= 1000;
+					break;
+				case 'M':
+					frequency *= 1000*1000;
+					break;
+				}
+				opt->opt_max_swj_frequency = frequency;
+			}
+			break;
 		case 's':
 			if (optarg)
 				opt->opt_serial = optarg;
@@ -206,6 +231,9 @@ void cl_init(BMP_CL_OPTIONS_t *opt, int argc, char **argv)
 		case 't':
 			opt->opt_mode = BMP_MODE_TEST;
 			cl_debuglevel |= BMP_DEBUG_INFO | BMP_DEBUG_STDOUT;
+			break;
+		case 'T':
+			opt->opt_mode = BMP_MODE_SWJ_TEST;
 			break;
 		case 'V':
 			opt->opt_mode = BMP_MODE_FLASH_VERIFY;
@@ -257,6 +285,7 @@ void cl_init(BMP_CL_OPTIONS_t *opt, int argc, char **argv)
 	}
 	/* Checks */
 	if ((opt->opt_flash_file) && ((opt->opt_mode == BMP_MODE_TEST ) ||
+								  (opt->opt_mode == BMP_MODE_SWJ_TEST) ||
 								  (opt->opt_mode == BMP_MODE_RESET))) {
 		DEBUG_WARN("Ignoring filename in reset/test mode\n");
 		opt->opt_flash_file = NULL;
@@ -284,21 +313,17 @@ int cl_execute(BMP_CL_OPTIONS_t *opt)
 {
 	int res = -1;
 	int num_targets;
-#if defined(PLATFORM_HAS_POWER_SWITCH)
 	if (opt->opt_tpwr) {
-		DEBUG_INFO("Powering up device");
 		platform_target_set_power(true);
 		platform_delay(500);
 	}
-#endif
 	if (opt->opt_connect_under_reset)
 		DEBUG_INFO("Connecting under reset\n");
 	connect_assert_srst = opt->opt_connect_under_reset;
 	platform_srst_set_val(opt->opt_connect_under_reset);
 	if (opt->opt_mode == BMP_MODE_TEST)
 		DEBUG_INFO("Running in Test Mode\n");
-	if (platform_target_voltage())
-		DEBUG_INFO("Target voltage: %s Volt\n", platform_target_voltage());
+	DEBUG_INFO("Target voltage: %s Volt\n", platform_target_voltage());
 	if (opt->opt_usejtag) {
 		num_targets = platform_jtag_scan(NULL);
 	} else {
@@ -365,7 +390,22 @@ int cl_execute(BMP_CL_OPTIONS_t *opt)
 	}
 	if (opt->opt_flash_start == 0xffffffff)
 		opt->opt_flash_start = flash_start;
-	if (opt->opt_mode == BMP_MODE_TEST)
+	if (opt->opt_mode == BMP_MODE_SWJ_TEST) {
+		switch (t->core[0]) {
+		case 'M':
+			DEBUG_WARN("Continious read/write-back DEMCR. Abort with ^C\n");
+			while(1) {
+				uint32_t demcr;
+				target_mem_read(t, &demcr, CORTEXM_DEMCR, 4);
+				target_mem_write32(t, CORTEXM_DEMCR, demcr);
+				platform_delay(1); /* To allow trigger*/
+			}
+		default:
+			DEBUG_WARN("No test for this core type yet\n");
+		}
+	}
+	if ((opt->opt_mode == BMP_MODE_TEST) ||
+		(opt->opt_mode == BMP_MODE_SWJ_TEST))
 		goto target_detach;
 	int read_file = -1;
 	if ((opt->opt_mode == BMP_MODE_FLASH_WRITE) ||
